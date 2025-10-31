@@ -63,11 +63,6 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # 3) Write wrapper into current host profile (clean replace)
-$profilePath = $PROFILE.CurrentUserCurrentHost
-if (!(Test-Path $profilePath)) {
-  New-Item -ItemType File -Path $profilePath -Force | Out-Null
-}
-
 $begin = '# BEGIN CODEX WSL WRAPPER'
 $end   = '# END CODEX WSL WRAPPER'
 $wrapper = @'
@@ -89,15 +84,114 @@ function codex {
 '@
 $wrapper = $wrapper.Replace('___DISTRO___', $distro)
 
-# Remove existing block and legacy functions, then append fresh block
-$devText = Get-Content $profilePath -Raw
-$devText = [regex]::Replace($devText, "(?s)$([regex]::Escape($begin)).*?$([regex]::Escape($end))", '')
-$devText = [regex]::Replace($devText, '(?s)function\s+Convert-ToWslPath\s*\([^)]*\)\s*\{.*?\}', '')
-$devText = [regex]::Replace($devText, '(?s)function\s+codex\s*\{.*?\}', '')
-$devText = ($devText.TrimEnd() + "`r`n`r`n" + $wrapper)
-Set-Content -Path $profilePath -Value $devText -Encoding UTF8
+# Target profiles: current host, all hosts, Visual Studio Developer PowerShell
+$profileTargets = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($path in @($PROFILE.CurrentUserCurrentHost, $PROFILE.CurrentUserAllHosts)) {
+  if (-not [string]::IsNullOrWhiteSpace($path)) { [void]$profileTargets.Add($path) }
+}
 
-# 4) Reload and confirm
-. $profilePath
-Write-Host "Profile updated: $profilePath" -ForegroundColor Cyan
+function Add-DocRoot {
+  param([string]$Path, [System.Collections.Generic.HashSet[string]]$RootSet)
+  if ([string]::IsNullOrWhiteSpace($Path)) { return }
+  try {
+    $expanded = [Environment]::ExpandEnvironmentVariables($Path)
+  } catch {
+    $expanded = $Path
+  }
+  if (-not [string]::IsNullOrWhiteSpace($expanded)) {
+    [void]$RootSet.Add($expanded)
+  }
+}
+
+$docRoots = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+try { Add-DocRoot -Path ([Environment]::GetFolderPath('MyDocuments')) -RootSet $docRoots } catch {}
+if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+  Add-DocRoot -Path (Join-Path -Path $env:USERPROFILE -ChildPath 'Documents') -RootSet $docRoots
+}
+foreach ($oneDriveVar in @('OneDrive', 'OneDriveCommercial', 'OneDriveConsumer')) {
+  $val = Get-Item -Path "Env:$oneDriveVar" -ErrorAction SilentlyContinue
+  if ($val -and -not [string]::IsNullOrWhiteSpace($val.Value)) {
+    Add-DocRoot -Path (Join-Path -Path $val.Value -ChildPath 'Documents') -RootSet $docRoots
+  }
+}
+
+foreach ($root in $docRoots) {
+  if ([string]::IsNullOrWhiteSpace($root)) { continue }
+  $vsRootProfile = Join-Path -Path $root -ChildPath 'Microsoft.VSDevShell_profile.ps1'
+  [void]$profileTargets.Add($vsRootProfile)
+
+  $psDir = Join-Path -Path $root -ChildPath 'PowerShell'
+  [void]$profileTargets.Add((Join-Path -Path $psDir -ChildPath 'Microsoft.VSDevShell_profile.ps1'))
+  $psHostProfile = Join-Path -Path $psDir -ChildPath 'Microsoft.PowerShell_profile.ps1'
+  if (Test-Path -Path $psHostProfile) {
+    [void]$profileTargets.Add($psHostProfile)
+  }
+  $defaultProfile = Join-Path -Path $psDir -ChildPath 'profile.ps1'
+  if (Test-Path -Path $defaultProfile) {
+    [void]$profileTargets.Add($defaultProfile)
+  }
+
+  try {
+    if (Test-Path -Path $root) {
+      $vsDirs = Get-ChildItem -Path $root -Directory -Filter 'Visual Studio*' -ErrorAction SilentlyContinue
+      foreach ($vsDir in $vsDirs) {
+        $vsPsDir = Join-Path -Path $vsDir.FullName -ChildPath 'PowerShell'
+        [void]$profileTargets.Add((Join-Path -Path $vsPsDir -ChildPath 'Microsoft.VSDevShell_profile.ps1'))
+        foreach ($name in @('Microsoft.PowerShell_profile.ps1', 'profile.ps1')) {
+          $candidate = Join-Path -Path $vsPsDir -ChildPath $name
+          if (Test-Path -Path $candidate) {
+            [void]$profileTargets.Add($candidate)
+          }
+        }
+      }
+    }
+  } catch {}
+}
+
+$updatedProfiles = @()
+foreach ($profilePath in $profileTargets) {
+  try {
+    $parent = Split-Path -Parent $profilePath
+    if (-not (Test-Path $parent)) {
+      New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+    $existingProfile = Test-Path $profilePath
+    $isWindowsPowerShell = $profilePath -match '\\WindowsPowerShell\\'
+    if (-not $existingProfile -and $isWindowsPowerShell) {
+      Write-Host "Skipping WindowsPowerShell profile (execution policy likely Restricted): $profilePath" -ForegroundColor DarkYellow
+      continue
+    }
+    if (-not $existingProfile) {
+      New-Item -ItemType File -Path $profilePath -Force | Out-Null
+    }
+    $devText = ''
+    if ($existingProfile) {
+      $devText = Get-Content $profilePath -Raw
+    }
+    if ($null -eq $devText) { $devText = '' }
+    $devText = [regex]::Replace($devText, "(?s)$([regex]::Escape($begin)).*?$([regex]::Escape($end))", '')
+    $devText = [regex]::Replace($devText, '(?s)function\s+Convert-ToWslPath\s*\([^)]*\)\s*\{.*?\}', '')
+    $devText = [regex]::Replace($devText, '(?s)function\s+codex\s*\{.*?\}', '')
+    if (-not [string]::IsNullOrWhiteSpace($devText)) {
+      $devText = $devText.TrimEnd() + "`r`n`r`n" + $wrapper
+    } else {
+      $devText = $wrapper
+    }
+    Set-Content -Path $profilePath -Value $devText -Encoding UTF8
+    $updatedProfiles += $profilePath
+    Write-Host "Updated Codex wrapper in profile: $profilePath" -ForegroundColor DarkGray
+  } catch {
+    Write-Warning "Failed to update profile '$profilePath': $_"
+  }
+}
+
+# 4) Reload and confirm for the current host profile (if updated)
+$currentProfile = $PROFILE.CurrentUserCurrentHost
+if ($currentProfile -and ($updatedProfiles -contains $currentProfile) -and (Test-Path $currentProfile)) {
+  . $currentProfile
+}
+Write-Host "Profile(s) updated:" -ForegroundColor Cyan
+foreach ($path in $updatedProfiles) {
+  Write-Host " - $path" -ForegroundColor Cyan
+}
 Write-Host "Run: Get-Command codex; codex --version" -ForegroundColor Cyan
