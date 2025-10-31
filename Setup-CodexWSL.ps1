@@ -45,7 +45,9 @@ which codex
 codex --version || true
 '@
 
-wsl bash -lc "$([string]::Join([environment]::NewLine,($wslInstall -split \"`r?`n\")))"
+# Execute the install script inside WSL. Build the command string cleanly to avoid quoting issues.
+$cmd = [string]::Join([Environment]::NewLine, ($wslInstall -split "`r?`n"))
+wsl bash -lc $cmd
 
 # 3) Ensure PowerShell profile exists
 if (!(Test-Path $PROFILE)) {
@@ -56,23 +58,23 @@ if (!(Test-Path $PROFILE)) {
 $profileText = Get-Content $PROFILE -Raw
 $begin = "# BEGIN CODEX WSL WRAPPER"
 $end   = "# END CODEX WSL WRAPPER"
-$wrapper = @"
-$begin
-function Convert-ToWslPath([string]\$winPath) {
-  if (\$winPath -match '^[A-Za-z]:\\') {
-    \$drive = \$winPath.Substring(0,1).ToLower()
-    \$rest  = \$winPath.Substring(2).Replace('\','/')
-    "/mnt/\$drive\$rest"
-  } else { \$winPath }
+$wrapper = @'
+# BEGIN CODEX WSL WRAPPER
+function Convert-ToWslPath([string]$winPath) {
+  if ($winPath -match "^[A-Za-z]:\\") {
+    $drive = $winPath.Substring(0,1).ToLower()
+    $rest  = $winPath.Substring(2).Replace("\\","/")
+    "/mnt/$drive$rest"
+  } else { $winPath }
 }
 function codex {
-  param([Parameter(ValueFromRemainingArguments=\$true)] \$Args)
-  \$win = \$PWD.Path
-  \$lin = Convert-ToWslPath \$win
-  wsl --cd "\$lin" codex @Args
+  param([Parameter(ValueFromRemainingArguments=$true)] $Args)
+  $win = $PWD.Path
+  $lin = Convert-ToWslPath $win
+  wsl --cd "$lin" codex @Args
 }
-$end
-"@
+# END CODEX WSL WRAPPER
+'@
 
 if ($profileText -match [regex]::Escape($begin) -and $profileText -match [regex]::Escape($end)) {
   $newProfile = $profileText -replace "(?s)$([regex]::Escape($begin)).*?$([regex]::Escape($end))", $wrapper
@@ -91,3 +93,4 @@ Write-Host "`nCodex in WSL:" -ForegroundColor Cyan
 wsl bash -lc 'which codex && codex --version || true'
 Write-Host "`nTry from this folder:" -ForegroundColor Cyan
 Write-Host "codex"
+
